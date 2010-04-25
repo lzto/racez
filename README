@@ -94,5 +94,14 @@ the final dynamic shared library will be libracez.so under the top directory
 5. run the test:
    cd benchmarks/test
    LD_PRELOAD=/path/to/libracez.so ./test-1
+   Now you can turn on different optimization use the following environment value:
+   RACEZ_LOCKSET=0 (turn on by default)
+   RACEZ_SIGNAL_WAIT=0 (turn off by default)
+   RACEZ_MEMORY_ALLOCATOR=1 (turn off by default)
+   RACEZ_STACKTRACE=1 (turn off by default)
+   RACEZ_SAMPLING_ADJUST=1 (turn off by default)
+   RACEZ_SAMPLE_SKID=1 (turn off by default)
+   RACEZ_SIGNAL_SAMPLE=1 (turn off by default)
+   RACEZ_WRITE_RECORD=1 (turn off by default)
 6. Known issues and solution
-   
+   TODO 
