@@ -1,0 +1,18 @@
+this patch is applied into the mao svn version 648.
+support features:
+1. only for PEBS samples now
+2. can compute memory address
+3. can extend samples both in forward and backforward direction within the basic block boundary
+
+issues:
+1. the updateSource does not work very well,espeically for C++ files, see the comments in source file
+2. now the bb->first_entry and bb->last_entry can be label entry, it's difficult to know if
+one insn entry is the first entry or last entry of bb
+3. only can handle limited insn type
+4. the code is very ugly and very redundant, should reconsider the framework of this case, especially
+for the forward and backward computation phase.
+5. the trick party if the difference between backward and forward compution. 
+6. now both signal and pmu samples can be extened, but is there any problems when applied into signal samples?
+7. NOTE that: now we can not handle global variable access directly from its name. it's tricky
+8. NOTE that: there will be problem if there is some nop operation different between the .s file and binary .s file
+we will get mismatch problem when processing them. 

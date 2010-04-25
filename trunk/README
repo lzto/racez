@@ -1,0 +1,98 @@
+*****Now the README is very prelimary, any question, please send the mail to tianwei.sheng@gmail.com *************
+Now Racez is implemented using libpfm. in order to compile the code and use the tool, you need to strictly follow the steps below:
+1. prerequisite (Now we only test the following combination)
+   * Linux kernel 2.6.30 (for kernel support)
+   * libpfm (for PMU API)
+   * libunwind (for stack trace reporting)
+   * Intel Core 2, Intel NHM, AMD K10 machines
+   * Ubuntu 9.10
+
+1.1 build and install the kernel:
+   - git clone git://git.kernel.org/pub/scm/linux/kernel/git/eranian/linux-2.6.git
+   source code will be in linux-2.6
+
+   - you need a kernel config file, called .config. Two ways to get
+one. First option
+   is to grab the one from the Ubuntu kernel. It is in
+/boot/config-2.6.XX. Copy it
+   to .config in the top of the kernel source tree. Second option, grab it from
+   /proc/config.gz. Decompress and copy as .config in top of kernel tree.
+
+   - make (or -j8 to launch multiple compiles in parallel). You will be
+prompted for
+   additional questions, including some to enable perfmon. Say Y to perfmon,
+   and perfmon debug, then say M for all processor support modules including
+   PEBS. In the end your .config file should show:
+
+CONFIG_PERFMON=y
+CONFIG_PERFMON_DEBUG=y
+CONFIG_PERFMON_DEBUG_FS=y
+CONFIG_X86_PERFMON_P4=m
+CONFIG_X86_PERFMON_PEBS_P4=m
+CONFIG_X86_PERFMON_CORE=m
+CONFIG_X86_PERFMON_PEBS_CORE=m
+CONFIG_X86_PERFMON_INTEL_ATOM=m
+CONFIG_X86_PERFMON_INTEL_NHM=m
+CONFIG_X86_PERFMON_PEBS=m
+CONFIG_X86_PERFMON_INTEL_ARCH=m
+CONFIG_X86_PERFMON_AMD64=m
+
+- Once compile is finished, you need to install the kernel. The
+easiest way to do
+ this is to type: make install
+
+- Then you need to install the kernel modules: make modules_install
+
+- Then you need to create the initial ramdisk with the kernel modules:
+ mkinitramfs -o /boot/initrd-2.6.30.img 2.6.30
+
+- Then you need to edit the bootloader config to add your kernel. For
+this you need
+ to edit /boot/grub/menu.lst. Clone an existing entry and make it
+point to your kernel
+ and initrd. It should look similar to:
+
+ title           PMU
+ root           (hd0,0)
+ kernel        /boot/vmlinuz-2.6.30
+root=UUID=099a4e05-51fc-4c3d-95c7-80538ff44189 ro
+ initrd          /boot/initrd-2.6.30.pmu
+
+  - Finally reboot, when the grub menu show up, select your kernel
+label, here PMU and watch
+ it boot. If that fails, then reboot and pick the regular Ubuntu kernel.
+
+1.2 install the libpfm
+ cvs -z3 -d:pserver:anonymous@perfmon2.cvs.sourceforge.net:/cvsroot/perfmon2
+co -P libpfm
+  make install (by default, it will be in /usr/local/lib), you need to add the path into LD_LIBRARY_PATH
+
+1.3. install the libunwind:
+   git clone git://git.sv.gnu.org/libunwind.git
+   autoreconf -i
+   ./configure
+   make
+   make install
+  by default, it will be installed into /usr/local/lib
+
+2. download and build the source code
+  make
+the final dynamic shared library will be libracez.so under the top directory
+
+3. build the offline detection tool
+  cd tools/
+  make
+
+4. build the mao tool
+   download the mao following the instruction at http://code.google.com/p/mao/
+   note that you need to check out a specific version and applied our patch:
+   svn co -r 648 http://mao.googlecode.com/svn/trunk/src 
+   mv mao-patch/patch .
+   patch -p0 < patch
+   build the mao 
+
+5. run the test:
+   cd benchmarks/test
+   LD_PRELOAD=/path/to/libracez.so ./test-1
+6. Known issues and solution
+   
