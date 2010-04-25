@@ -22,7 +22,8 @@
 #include <sys/mman.h>
 #include <assert.h>
 //#include <google/stacktrace.h> // for stacktrace
-// TODO(tianweis): Use the code as google to decide if we use glibc backtrace
+// TODO(tianweis): Use the code as google-perf-tool(http://code.google.com/p/google-perftools/)
+//  to decide if we use glibc backtrace
 // or libunwind. Now we found that glibc backtrace has some problem, we need to
 // use latest libunwind library from its git repository.
 // git clone git://git.sv.gnu.org/libunwind.git
@@ -83,7 +84,7 @@ typedef pfm_pebs_core_smpl_entry_t	core_smpl_entry_t;
 typedef pfm_pebs_nhm_smpl_entry_t       nhm_smpl_entry_t;
 
 static   int type;
-static const char* file_name = "/home/tianwei/b.txt";
+static const char* file_name = "/tmp/b.txt";
 
 #define NUM_PMCS	16
 #define NUM_PMDS	16
@@ -95,7 +96,7 @@ static const char* file_name = "/home/tianwei/b.txt";
 
 #define PMD_IBSOP_NUM		7
 
-#define SMPL_PERIOD	20001ULL	 /* must not use more bits than actual HW
+#define SMPL_PERIOD	200001ULL	 /* must not use more bits than actual HW
  counter width */
 
 typedef map<int, int>TID_FD_MAP;

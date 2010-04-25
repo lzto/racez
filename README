@@ -94,9 +94,9 @@ the final dynamic shared library will be libracez.so under the top directory
 5. run the test:
    cd benchmarks/test
    LD_PRELOAD=/path/to/libracez.so ./test-1
-   Now you can turn on different optimization use the following environment value:
+   Now you can turn on/off different optimization use the following environment value:
    RACEZ_LOCKSET=0 (turn on by default)
-   RACEZ_SIGNAL_WAIT=0 (turn off by default)
+   RACEZ_SIGNAL_WAIT=1 (turn off by default)
    RACEZ_MEMORY_ALLOCATOR=1 (turn off by default)
    RACEZ_STACKTRACE=1 (turn off by default)
    RACEZ_SAMPLING_ADJUST=1 (turn off by default)
@@ -104,4 +104,16 @@ the final dynamic shared library will be libracez.so under the top directory
    RACEZ_SIGNAL_SAMPLE=1 (turn off by default)
    RACEZ_WRITE_RECORD=1 (turn off by default)
 6. Known issues and solution
-   TODO 
+6.1 now smpl_pebs is compiled as a kernel module, you need to explict install it as:
+    sudo modprobe perfmon_pebs_smpl
+6.2 When monitoring large application, if you start up large number of threads, you need to 
+    enter the ulimit for locked memory
+    first check "ulimit -l", on unbuntu machine:
+    a.sudo gedit /etc/security/limits.conf 
+      add the following line:
+     *                hard    memlock         unlimited
+   b. sudo gedit /etc/pam.d/common-session
+      add the following line:
+     session required pam_limits.so
+   c. reboot
+6.3 ... 
