@@ -1,0 +1,1623 @@
+Index: MaoDefs.h
+===================================================================
+--- MaoDefs.h	(revision 648)
++++ MaoDefs.h	(working copy)
+@@ -109,4 +109,7 @@
+ 
+ const reg_entry *GetRegFromName(const char *reg_name);
+ 
++int GetBaseRegisterNum(InstructionEntry *insn);
++int GetIndexRegisterNum(InstructionEntry *insn);
++int GetRegisterOperandNum(InstructionEntry *insn, const unsigned int op_index);
+ #endif  // __MAODEFS_H_INCLUDED
+Index: Makefile
+===================================================================
+--- Makefile	(revision 648)
++++ Makefile	(working copy)
+@@ -48,7 +48,7 @@
+ 	-I$(BINUTILSRC)/include			\
+ 	-I$(BINUTILOBJ)/include			\
+ 	-DLOCALEDIR="\"$(LOCALEDIR)\""		\
+-	-g -O2 -Wall -fno-exceptions
++	-g -O0 -Wall -fno-exceptions
+ 
+ MAKEDEPEND=gcc -MM $(CFLAGS) -o $(patsubst %.o,%.P,$@) $<
+ 
+@@ -115,6 +115,7 @@
+ 	MaoPrefetchNta.cc			\
+ 	MaoInsertPrefNta.cc			\
+ 	MaoProfile.cc				\
++	MaoInstructionSim.cc			\
+ 	MaoRedundantTestElim.cc			\
+ 	MaoRedundantMemMove.cc			\
+ 	MaoBranchSeparator.cc			\
+Index: MaoUnit.h
+===================================================================
+--- MaoUnit.h	(revision 648)
++++ MaoUnit.h	(working copy)
+@@ -116,6 +116,13 @@
+ 
+   InstructionEntry *nextInstruction();
+   InstructionEntry *prevInstruction();
++  // These two functions are different from the above two ones.
++  // Here we will skip non instruction-type entry and continue to
++  // search the instruction while the above two will return NULL
++  // and stop.
++  // TODO(tianweis): Add a more reasonable name for these two functions.
++  InstructionEntry *NextInstruction();
++  InstructionEntry *PrevInstruction();
+ 
+   void Unlink();
+   // Take 'entry' and link it in before/after current instruction
+@@ -457,6 +464,8 @@
+   bool IsCall() const;
+   bool IsReturn() const;
+   bool IsAdd() const;
++  bool IsSub() const;
++  bool IsLea() const;
+   bool IsOpMov() const { return op() == OP_mov || op() == OP_movq; }
+   bool IsPredicated() const;
+ 
+Index: MaoInstructionSim.cc
+===================================================================
+--- MaoInstructionSim.cc	(revision 0)
++++ MaoInstructionSim.cc	(revision 0)
+@@ -0,0 +1,1392 @@
++//
++// Copyright 2009 Google Inc.
++//
++// This program is free software; you can redistribute it and/or to
++// modify it under the terms of the GNU General Public License
++// as published by the Free Software Foundation; either version 2
++// of the License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program; if not, write to the
++//   Free Software Foundation, Inc.,
++//   51 Franklin Street, Fifth Floor,
++//   Boston, MA  02110-1301, USA.
++
++// Given a register value, execute a simple instruction
++// simulation pass to compute other register values.
++// Now only basic block and simple instructions are supported.
++
++// Now assume we have the following sample format in the input file:
++// sample 1: {thread_id,IP address,RD/WR,memory address (lockset)}.
++// The pass first read the sample line by line, for each line,read the
++// second field, and map it into a static instruction address in a function.
++// for the third field, given the static instruction address, get the register
++// value for the operand,then execute the following instruction until the end of
++// the basic block.
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <perfmon/perfmon_pebs_core_smpl.h>
++#include <iterator>
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++#include <set>
++
++#include "MaoDebug.h"
++#include "MaoUnit.h"
++#include "MaoPasses.h"
++#include "MaoCFG.h"
++#include "MaoDefs.h"
++#include "MaoLoops.h"
++#include "MaoRelax.h"
++
++
++#include "libiberty.h"
++
++using std::insert_iterator;
++using std::vector;
++using std::pair;
++using std::string;
++
++// --------------------------------------------------------------------
++// Options
++// --------------------------------------------------------------------
++MAO_OPTIONS_DEFINE(INSTSIM, 2) {
++  OPTION_STR("pmuprofile_file", "/dev/null",
++	     "Filename from which to read profiles."),
++  OPTION_STR("racez_raw_file", "/dev/null",
++         "raw data from racez."),
++};
++
++
++// This file defines a buffer data structure to store the different events. 
++typedef enum  {
++  MEMORY_OP = 1,
++  SYNC_LOCK = 2,
++  SYNC_UNLOCK = 3,
++  SYNC_SIGNAL = 4,
++  SYNC_WAIT = 5,
++  MEMORY_ALLOC = 6
++} RecordType;
++
++// A record is used to store one line in log file
++struct Record {
++  int record_no_;
++  int thread_id_;
++  RecordType type_;
++  union {
++    struct {
++      void* memory_address_;
++      void* pip_;
++      void* sip_;
++      int   is_write_;
++      pfm_pebs_core_smpl_entry_t memory_op_; 
++      int lock_count_;
++      void *lockset_[10];
++    }memory_access_;
++    struct {
++      void *lock_address_;
++    }lock_op_;
++    struct {
++      void *signal_address_;
++    }signal_op_;
++    struct {
++      void *wait_address1_;
++      void *wait_address2_;
++    }wait_op_;
++    struct {
++      void*start_address_;
++      int size_;
++      int is_alloc_;
++    }mem_alloc_op_;
++  }op_;
++  void* stack_trace_[10];
++  int trace_depth_;
++};
++
++struct RacezInstructionSample {
++  RacezInstructionSample(const string &file_a,long index_a, long offset_a, long value_a) :
++    file(file_a), index(index_a), offset(offset_a), value(value_a) { }
++  long index;
++  const string file;
++  const long offset;
++  long value;
++  bool operator < (const RacezInstructionSample& sample_a) {
++    return offset < sample_a.offset;
++  }
++};
++
++bool RacezInstructionSampleLessThan(const RacezInstructionSample *sample1,
++                  const RacezInstructionSample *sample2) {
++    return (sample1->offset < sample2->offset);
++}
++
++typedef std::list<RacezInstructionSample *> RacezInstructionSampleList;
++typedef RacezInstructionSampleList::iterator RacezInstructionSampleListIter;
++
++class RacezProfileReader {
++ public:
++  RacezProfileReader(const char *filename)
++      : filename_(filename), data_file_(NULL), buffer_(NULL),
++        buffer_size_(0) { }
++
++  bool Read(const string &function_name, RacezInstructionSampleList *samples,
++            const string *current_source_file);
++
++ private:
++  bool ReadLine();
++  void CleanUp();
++
++  static const int kBufferSizeIncrement;
++  const char *const filename_;
++  FILE *data_file_;
++  char *buffer_;
++  int buffer_size_;
++
++  RacezProfileReader(const RacezProfileReader&);
++  void operator=(const RacezProfileReader&);
++};
++
++const int RacezProfileReader::kBufferSizeIncrement = BUFSIZ;
++
++bool RacezProfileReader::ReadLine() {
++  if (feof(data_file_))
++    return false;
++
++  char *ptr = buffer_;
++  int amt = buffer_size_;
++  while (fgets(ptr, amt, data_file_)) {
++    int len = strlen(ptr);
++    if (ptr[strlen(ptr) - 1] != '\n' && !feof(data_file_)) {
++      // The buffer must not have been large enough, so let's grow it.
++      buffer_size_ += kBufferSizeIncrement;
++      buffer_ = static_cast<char *>(xrealloc(buffer_, buffer_size_));
++
++      ptr += len;
++      amt += (kBufferSizeIncrement - len);
++    } else {
++      return true;
++    }
++  }
++  return false;
++}
++
++void RacezProfileReader::CleanUp() {
++  if (data_file_) {
++    fclose(data_file_);
++    data_file_ = NULL;
++  }
++
++  if (buffer_) {
++    free(buffer_);
++    buffer_size_ = 0;
++  }
++}
++
++// TODO(tianweis): To generalize these function with those in
++// MaoProfile.cc since most of them are nearly same.
++bool RacezProfileReader::Read(const string &function_name,
++                              RacezInstructionSampleList *samples, const string* current_source_file) {
++  // Open the file
++  data_file_ = fopen(filename_, "r");
++  if (!data_file_) {
++    fprintf(stderr, "Could not open sample profile file: %s\n", filename_);
++    CleanUp();
++    return false;
++  }
++
++  // Initialize the buffer used to read data
++  buffer_size_ = kBufferSizeIncrement;
++  buffer_ = static_cast<char *>(xmalloc(buffer_size_));
++
++  // Read the data line by line
++  while (ReadLine()) {
++    char *ptr, *delim, *endptr;
++    int len;
++
++    // Extract the entry index
++    ptr = buffer_;
++    delim = strchr(ptr, '\t');
++    if (!delim)
++      goto parse_error;
++    *delim = '\0';
++    long index = strtoll(ptr, &endptr, 0);
++    *delim = '\t';
++    if (endptr != delim)
++      goto parse_error;
++
++    // Extract the filename
++    ptr = delim+1;
++    delim = strchr(ptr, ':');
++    if (!delim)
++      goto parse_error;
++    len = delim - ptr;
++    string file(ptr, len);
++    
++    if(file != (*current_source_file))
++      continue;
++    // Skip the file offset
++    while(*delim != '\t')
++      delim++;
++
++    // Extract the function name
++    ptr = delim+1;
++    delim = strchr(ptr, '\t');
++    if (!delim)
++      goto parse_error;
++    len = delim - ptr;
++    string func(ptr, len);
++
++    // Extract the function offset
++    // TODO(tianweis): now offset is followed by a '\n'
++    ptr = delim+1;
++    delim = strchr(ptr, '\n');
++    if (!delim)
++      goto parse_error;
++    *delim = '\0';
++    long offset = strtoll(ptr, &endptr, 0);
++    *delim = '\t';
++    if (endptr != delim)
++      goto parse_error;
++
++    // Reserve this for IBS
++    long value = 0;
++
++    // First to see if the function is what we want
++    if (func.compare(function_name) != 0)
++      continue;
++    RacezInstructionSample *sample = new RacezInstructionSample(file, index,
++                                                                offset, value);
++    // Store the sample and push back the element
++    samples->push_back(sample);
++  }
++
++  CleanUp();
++  return true;
++
++parse_error:
++  fprintf(stderr, "Could not parse sample data file line: %s\n", buffer_);
++  CleanUp();
++  return false;
++}
++
++struct ExpressionEntry {
++  ExpressionEntry (int base_register, int index_register,
++                   long offset_a, int scale, bool is_memory_a, bool is_valid) :
++      base_register_(base_register), index_register_(index_register_),
++      offset_(offset_a), scale_(scale), is_memory_(is_memory_a),
++      is_valid_(is_valid) { }
++  int base_register_;
++  int index_register_;
++  long offset_;
++  int scale_;
++  bool is_memory_;
++  bool is_valid_;
++};
++
++struct eqstr {
++  bool operator() (ExpressionEntry* s1, ExpressionEntry* s2) const {
++
++    if (s1->base_register_ < s2->base_register_)
++      return true;
++    else if (s1->base_register_ == s2->base_register_ &&
++             s1->index_register_ < s2->index_register_)
++      return true;
++    else if (s1->base_register_ == s2->base_register_ &&
++             s1->index_register_ == s2->index_register_ &&
++             s1->offset_ < s2->offset_)
++      return true;
++    else if (s1->base_register_ == s2->base_register_ &&
++             s1->index_register_ == s2->index_register_ &&
++             s1->offset_ == s2->offset_ &&
++             s1->scale_ < s2->scale_)
++      return true;
++    else if (s1->base_register_ == s2->base_register_ &&
++             s1->index_register_ == s2->index_register_ &&
++             s1->offset_ == s2->offset_ &&
++             s1->scale_ == s2->scale_ &&
++             s1->is_memory_ < s2->is_memory_)
++      return true;
++    else
++      return false;
++  }
++};
++
++typedef std::map<ExpressionEntry*, long, eqstr> ExpressionEntryMap;
++
++typedef std::map<const reg_entry*, long> RegMap;
++class InstructSimPass : public MaoFunctionPass {
++public:
++  InstructSimPass(MaoOptionMap *options, MaoUnit *mao, Function *function)
++    : MaoFunctionPass("INSTSIM", options, mao, function),
++      pmuprofile_file_(GetOptionString("pmuprofile_file")),
++      racez_raw_file_(GetOptionString("racez_raw_file")) {
++    register_file_ = (long*)malloc(sizeof(long) * i386_regtab_size);
++    MAO_ASSERT(racez_raw_file_ != NULL);
++    MAO_ASSERT(pmuprofile_file_ != NULL);
++    raw_fd_ = open(racez_raw_file_, O_RDWR | O_CREAT, (mode_t)0600);
++    if (raw_fd_ == -1) {
++      perror("Error opening file for writing");
++      MAO_ASSERT(0);
++    }
++    struct stat filestat;
++    int fstat_rv =fstat(raw_fd_, &filestat);
++    if(fstat_rv != 0) {
++      perror("Error, fstat error\n");
++      MAO_ASSERT(0);
++    } 
++    raw_file_size_ = filestat.st_size;
++    // We use a mmap to map the racwz_race_file_ inside the constructor
++    raw_record_ =  (struct Record*)mmap(0, raw_file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, raw_fd_, 0);
++    if (raw_record_ == MAP_FAILED) {
++      close(raw_fd_);
++      perror("Error mmapping the file");
++      MAO_ASSERT(0);
++    }
++  }
++  virtual bool Go();
++
++ private:
++  void ClearSampleList();
++  void BuildFileTable();
++  long GetScaleValue(InstructionEntry*);
++  long GetSimpleDisp(InstructionEntry*, int);
++  void PrintNewSample(InstructionEntry*, long);
++  bool ComputeAddress(InstructionEntry*, unsigned int, long*);
++  bool ComputeNewSample(InstructionEntry*, bool);
++  bool InsnCanHandle(InstructionEntry*);
++  void InvalidateRegister(RegMap*, const reg_entry*);
++  bool ComputeNewSampleWhole(InstructionEntry*, long, long, int);
++  void UpdateState(InstructionEntry*, unsigned int, long, bool);
++  void ExecuteSim(InstructionEntry*, long);
++  void ExecuteSimWhole(InstructionEntry*, long, MaoEntryIntMap*);
++  void PrintList(RacezInstructionSampleList *);
++  void UpdateMemory(InstructionEntry*, long);
++  long ComputeMemory(InstructionEntry*, long, int, int);
++  long GetValueFromRegister(const reg_entry*, long, int);
++  const string *UpdateSourceFile(MaoEntry *entry,
++                                 const string *current_source_file) const;
++
++  const char *const pmuprofile_file_;
++  const char *const racez_raw_file_;
++  struct Record* raw_record_;
++  int raw_file_size_;
++  int raw_fd_;
++  int new_record_fd_;
++  // A sample map for a function, each time it only store the samples for
++  // a function. Need to clear the samples before reading from file for a
++  // new function.
++  RacezInstructionSampleList samples_;
++  std::vector<string> file_table_;
++  // register file and expression value state
++  long * register_file_;
++  
++  RegMap backward_reg_map_;
++  RegMap forward_reg_map_;
++  ExpressionEntryMap expr_map_;
++};
++
++void InstructSimPass::ClearSampleList() {
++  // First delete the element which is allocated in
++  // RacezProfileReader::Read().
++  for (RacezInstructionSampleListIter iter = samples_.begin();
++       iter != samples_.end(); iter++) {
++    if ((*iter) != 0)
++      delete (*iter);
++  }
++  // Clear the list
++  samples_.clear();
++}
++
++void InstructSimPass::BuildFileTable() {
++  // The first entry of the file table should be empty.
++  file_table_.push_back("");
++
++  for (ConstSectionIterator section = unit_->ConstSectionBegin();
++       section != unit_->ConstSectionEnd(); ++section) {
++    for (SectionEntryIterator entry = (*section)->EntryBegin();
++         entry != (*section)->EntryEnd(); ++entry) {
++      if (!(*entry)->IsDirective())
++        continue;
++      DirectiveEntry *directive = (*entry)->AsDirective();
++
++      // Only process .file directives.
++      if (directive->op() != DirectiveEntry::FILE)
++        continue;
++
++      // Only process ELF-style 2 operand file directives.
++      if (directive->NumOperands() != 2)
++        continue;
++
++      const DirectiveEntry::Operand *number = directive->GetOperand(0);
++      const DirectiveEntry::Operand *file = directive->GetOperand(1);
++
++      if (number->type != DirectiveEntry::INT)
++        continue;
++      if (file->type != DirectiveEntry::STRING)
++        continue;
++
++      // Strip off the quotes around the filename.
++      string temp_filename((*file->data.str), 1, (*file->data.str).length() - 2);
++      // TODO(tianweis): temporal fix for gnu makefile, where it will
++      // enter a working dir directory and compile .cc/.c file which used
++      // the relative path.
++      char buf[100];
++      string working_dir = getcwd(buf, 100);
++      string slash = "/";
++      string filename = working_dir + slash + temp_filename;
++
++      if (number->data.i == 0) {
++        file_table_.push_back(filename);
++      } else {
++        if (number->data.i < 0) {
++          fprintf(stderr, "File directive uses a negative file index: ");
++          directive->PrintIR(stderr);
++          fprintf(stderr, "\n");
++          exit(1);
++        }
++
++        unsigned int filenum = (unsigned int)number->data.i;
++        if (file_table_.size() <= filenum)
++          file_table_.resize(filenum + 1);
++        file_table_[filenum] = filename;
++      }
++    }
++  }
++}
++
++
++const string *InstructSimPass::UpdateSourceFile(
++    MaoEntry *entry, const string *current_source_file) const {
++  if (!entry->IsDirective())
++    return current_source_file;
++
++  DirectiveEntry *directive = entry->AsDirective();
++  if (directive->op() != DirectiveEntry::LOC)
++    return current_source_file;
++
++  MAO_ASSERT(directive->NumOperands() >= 1);
++  const DirectiveEntry::Operand *operand = directive->GetOperand(0);
++  MAO_ASSERT(operand->type == DirectiveEntry::INT);
++
++  if (operand->data.i < 0) {
++    fprintf(stderr, "Location directive uses a negative file index: ");
++    directive->PrintIR(stderr);
++    fprintf(stderr, "\n");
++    exit(1);
++  }
++  unsigned int file_number = operand->data.i;
++
++  if (file_number >= file_table_.size()) {
++    fprintf(stderr, "Debug information refers to non-existant file: ");
++    directive->PrintIR(stderr);
++    fprintf(stderr, "\n");
++    exit(1);
++  }
++
++  return &file_table_[file_number];
++}
++
++// TODO(tianweis): Check the code again.
++long InstructSimPass::GetScaleValue(InstructionEntry* insn) {
++  long scale_value;
++  int scale[] = { 1, 2, 4, 8 };
++  unsigned int scale_factor = insn->GetLog2ScaleFactor();
++  if (scale_factor) {
++    scale_value = scale[scale_factor];
++  } else {
++    scale_value = 1;
++  }
++  return scale_value;
++}
++
++long InstructSimPass::GetSimpleDisp(InstructionEntry* insn, int op_index) {
++  long offset;
++  expressionS* expr;
++  if (insn->HasDisplacement(op_index)) {
++    expr = insn->GetDisplacement(op_index);
++    if (expr->X_op == O_constant)
++      offset = expr->X_add_number;
++    else
++      offset = ~0;
++  } else {
++    offset = 0;
++  }
++  return offset;
++}
++void InstructSimPass::PrintNewSample(InstructionEntry *insn, long address) {
++  if (tracing_level() >= 1) {
++    insn->PrintIR(stderr);
++    fprintf(stderr," new sample, address is %ld\n", address);
++  }
++}
++
++// Return two parts:
++// if return value = true, address is the real memory address for memory operand.
++// if return value = false, address is only the map value for the memory operand
++// expression, now that means the value  in the memory address.
++bool InstructSimPass::ComputeAddress(InstructionEntry *insn,
++                                     unsigned int op_index, long* address) {
++  long offset = 0;
++  int scale;
++  int base_num;
++  long base_value;
++  int index_num;
++  long index_value;
++  ExpressionEntry * expr_entry;
++
++  offset = GetSimpleDisp(insn,op_index);
++  base_num = GetBaseRegisterNum(insn);
++  index_num = GetIndexRegisterNum(insn);
++  scale = GetScaleValue(insn);
++  expr_entry = new ExpressionEntry(base_num, index_num,
++                                   offset, scale, true, true);
++  // TODO(tianweis): Check the correctness of the following code.
++  pair<ExpressionEntryMap::iterator, bool> map_status =
++      expr_map_.insert(ExpressionEntryMap::value_type(expr_entry, NULL));
++  if (!map_status.second) {
++    *address =  map_status.first->second;
++    delete expr_entry;
++    if (!map_status.first->first->is_memory_)
++      return true;
++    else
++      return false;
++  } else {
++    // We do not insert here.
++    delete expr_entry;
++    expr_map_.erase(map_status.first);
++  }
++  // If not cached, to see if we can compute from register values.
++  if (offset != ~0) {
++    // One must have base register
++    base_value = register_file_[base_num];
++    // One may have index register
++    if (index_num != ~0)
++      index_value = register_file_[index_num];
++    else
++      index_value = 0;
++
++    if (base_value != ~0 && index_value != ~0 && scale != ~0) {
++      *address = offset + base_value + index_value * scale;
++      return true;
++    }
++  }
++  *address = ~0;
++  return false;
++}
++// Given the current register file and expression map,
++// compute new sample for this insn if possible.
++// Return false if we do not know the side effect of this instruction.
++// In the caller, if the return value is false, it will stop the computation both
++// in backward and forward computation.
++// TODO(tianweis): To clearly understand the role of backward and
++// forward computation.
++bool InstructSimPass::ComputeNewSample(InstructionEntry* insn,
++                                          bool direction) {
++  int ret = false;
++  if (!(insn->IsOpMov() || insn->IsAdd() ||
++        insn->IsSub() || insn->IsLea())) {
++    // TODO(tianweis): To classify the zero-operand much clearly.
++    if (insn->NumOperands() == 0 )
++      return true;
++    // Simple two operands insn
++    if (insn->NumOperands() == 1) {
++      if (insn->op() == OP_push) {
++        return true;
++      }
++      if (insn->op() == OP_pop) {
++        int reg_num = GetRegisterOperandNum(insn, 0);
++        register_file_[reg_num] = ~0;
++        return true;
++      }
++      else
++        return false;
++    }
++    if (insn->NumOperands() == 2) {
++      // Clear the second operand register.
++      // TODO(tianweis): Support more types of operations.
++      if( insn->IsPredicated() || insn->op() == OP_xor) {
++        int reg_num = GetRegisterOperandNum(insn, 1);
++        register_file_[reg_num] = ~0;
++        return true;
++      }
++      // no side effect
++      if (insn->op() == OP_cmp || insn->op() == OP_test) {
++        return true;
++      }
++      else
++        return false;
++    }
++    // TODO(tianweis): Support more than 2 operands
++    if (insn->NumOperands() > 2) {
++      return false;
++    }
++  }
++  long address = ~0;
++  // For op_mov, op_add, op_sub
++  if (insn->IsOpMov() || insn->IsAdd() || insn->IsSub()) {
++    MAO_ASSERT(insn->NumOperands() == 2);
++    // Get new sample if address is computable
++    // For mov m, r, only compute when forard because
++    // in m, it may include r.
++    // TODO(tianweis): To see if m includes r.
++    if (insn->IsMemOperand(0) && direction) {
++      if (ComputeAddress(insn, 0, &address))
++        PrintNewSample(insn, address);
++    }
++    // For mov r, m, both backward and forward is applicable.
++    if (insn->IsMemOperand(1)) {
++      if (ComputeAddress(insn, 1, &address))
++        PrintNewSample(insn, address);
++    }
++  }
++  if (direction == false) {
++    if (insn->IsMemOperand(0)) {
++      // For example: mov m, r, for backford computation,
++      // set the map for m->r if r is known. We do not need
++      // to worry about if r is included in m because the map
++      // the reg_num, not value.
++      long value = register_file_[GetRegisterOperandNum(insn, 1)];
++      if (value != ~0)
++        UpdateState(insn, 0, value, true);
++      ret = true;
++    } else if (insn->IsMemOperand(1)) {
++      // For mov r,m , only will update the memory,
++      // set the map
++      long value = register_file_[GetRegisterOperandNum(insn, 0)];
++      if (value != ~0)
++        UpdateState(insn, 1, value, true);
++      ret = true;
++    } else {
++      // TODO(tianweis): To model other instruction
++      ret = false;
++    }
++  } else if (direction == true ) {
++    if (insn->IsMemOperand(1)) {
++      // For example: mov r,m, for forward computation
++      // set the map for m->r if r is known
++      long value = register_file_[GetRegisterOperandNum(insn, 0)];
++      if (value != ~0)
++        UpdateState(insn, 0, value, true);
++      ret = true;
++    } else if (insn->IsMemOperand(0)) {
++      // unlike to backward computation, we can not set the map here because
++      // we definitely do not know the memory content for mov m,r.
++      // The address may have been computed by look up the map.
++      register_file_[GetRegisterOperandNum(insn, 1)] = address;
++      ret = true;
++    } else {
++      ret = false;
++    }
++  }
++  return ret;
++}
++
++// We now only can handle mov, add, sub, lea, cmp, test, jmp
++bool InstructSimPass::InsnCanHandle(InstructionEntry* insn) {
++  if (!(insn->IsOpMov() || insn->IsAdd() ||
++        insn->IsSub() || insn->IsLea() || insn->op() == OP_cmp ||
++        insn->op() == OP_test || insn->HasTarget())) {
++    return false;
++  }
++  return true;
++}
++void InstructSimPass::InvalidateRegister(RegMap* map, const reg_entry* result) {
++  const reg_entry *r_eip = GetRegFromName("eip"); 
++  const reg_entry *r_eax = GetRegFromName("eax");
++  const reg_entry *r_ebx = GetRegFromName("ebx");
++  const reg_entry *r_ecx = GetRegFromName("ecx");
++  const reg_entry *r_edx = GetRegFromName("edx");
++  const reg_entry *r_esi = GetRegFromName("esi");
++  const reg_entry *r_edi = GetRegFromName("edi");
++  const reg_entry *r_ebp = GetRegFromName("ebp");
++  const reg_entry *r_esp = GetRegFromName("esp");
++
++  const reg_entry *r_rip = GetRegFromName("rip"); 
++  const reg_entry *r_rax = GetRegFromName("rax");
++  const reg_entry *r_rbx = GetRegFromName("rbx");
++  const reg_entry *r_rcx = GetRegFromName("rcx");
++  const reg_entry *r_rdx = GetRegFromName("rdx");
++  const reg_entry *r_rsi = GetRegFromName("rsi");
++  const reg_entry *r_rdi = GetRegFromName("rdi");
++  const reg_entry *r_rbp = GetRegFromName("rbp");
++  const reg_entry *r_rsp = GetRegFromName("rsp"); 
++   
++  if(result == r_eip || result == r_rip) {
++    (*map)[r_eip] = -1;
++    (*map)[r_rip] = -1;  
++  } else if(result == r_eax || result == r_rax) {
++    (*map)[r_eax] = -1;
++    (*map)[r_rax] = -1;  
++  } else  if(result == r_ebx || result == r_rbx) {
++    (*map)[r_ebx] = -1;
++    (*map)[r_rbx] = -1;  
++  } else  if(result == r_ecx || result == r_rcx) {
++    (*map)[r_ecx] = -1;
++    (*map)[r_rcx] = -1;  
++  } else  if(result == r_edx || result == r_rdx) {
++    (*map)[r_edx] = -1;
++    (*map)[r_rdx] = -1;  
++  } else  if(result == r_esi || result == r_rsi) {
++    (*map)[r_esi] = -1;
++    (*map)[r_rsi] = -1;  
++  } else  if(result == r_edi || result == r_rdi) {
++    (*map)[r_edi] = -1;
++    (*map)[r_rdi] = -1;  
++  } else  if(result == r_ebp || result == r_rbp) {
++    (*map)[r_ebp] = -1;
++    (*map)[r_rbp] = -1;  
++  } else  if(result == r_esp || result == r_rsp) {
++    (*map)[r_esp] = -1;
++    (*map)[r_rsp] = -1;  
++  } else {
++    (*map)[result] = -1;
++  }
++  return;
++}
++
++bool InstructSimPass::ComputeNewSampleWhole(InstructionEntry* insn, long index,
++                                            long offset, int direction) {
++  // Now we do conservative analysis and stop when we met unrecognized
++  // instruction. 
++  // TODO(tianweis): we do not need to stop for other kinds of instructions
++  bool ret = true;
++  long address = 0;
++  const reg_entry* result_regentry = NULL;
++  if (!InsnCanHandle(insn)) {
++    return false;
++  }
++  // For op_mov, op_add, op_sub, op_lea
++  if (insn->IsOpMov() || insn->IsAdd() || insn->IsSub() || insn->IsLea()) {
++    MAO_ASSERT(insn->NumOperands() == 2);
++    if(direction == 1) {
++      if (insn->IsMemOperand(0) || insn->IsMemOperand(1)) {
++        if(insn->IsMemOperand(0)) { 
++          address = ComputeMemory(insn, index, 0, direction);
++          // What ever, we set the result register map as -1
++          result_regentry = insn->GetRegisterOperand(1);
++          // set the reg map entry to -1 to denote this register is polluted.
++          InvalidateRegister(&forward_reg_map_, result_regentry);
++          if(address == -1)
++            return ret;
++          struct Record new_record;
++          memset(&new_record, 0, sizeof(struct Record));
++          new_record.type_ = MEMORY_OP;
++          // set the memory type according to the insn
++          new_record.op_.memory_access_.is_write_ = 0;
++          // set the ip according to the seed insn and offset
++          long ip  =  raw_record_[index].op_.memory_access_.memory_op_.ip +
++            offset;
++          // TODO(tianweis):How to handle the record_no??
++          new_record.record_no_ = raw_record_[index].record_no_;
++          new_record.thread_id_ = raw_record_[index].thread_id_;
++          new_record.op_.memory_access_.pip_ = (void*)ip;
++          new_record.op_.memory_access_.sip_ = (void*)ip;
++          new_record.op_.memory_access_.memory_address_ = (void*)address;
++          new_record.op_.memory_access_.lock_count_ = raw_record_[index].op_.memory_access_.lock_count_;
++          for(int i = 0; i< new_record.op_.memory_access_.lock_count_; i++)
++            new_record.op_.memory_access_.lockset_[i] = raw_record_[index].op_.memory_access_.lockset_[i];
++          // write a new record into a new file which has the same format as the
++          // raw record file.
++          int nbytes = sizeof(struct Record);
++          if(write(new_record_fd_, &new_record, nbytes) == -1) {
++            perror("stop buffer");
++            printf("*********new_record_fd_:%d, write error:%d***********\n", new_record_fd_, errno);
++          }
++        } else {
++          address = ComputeMemory(insn, index, 1, direction);
++          if(address == -1)
++            return ret;
++          struct Record new_record;
++          memset(&new_record, 0, sizeof(struct Record));
++          new_record.type_ = MEMORY_OP;
++          // set the memory type according to the insn
++          new_record.op_.memory_access_.is_write_ = 1;
++          // set the ip according to the seed insn and offset
++          long ip  =  raw_record_[index].op_.memory_access_.memory_op_.ip +
++            offset;
++          // TODO(tianweis):How to handle the record_no??
++          new_record.record_no_ = raw_record_[index].record_no_;
++          new_record.thread_id_ = raw_record_[index].thread_id_;
++          new_record.op_.memory_access_.pip_ = (void*)ip;
++          new_record.op_.memory_access_.sip_ = (void*)ip;
++          new_record.op_.memory_access_.memory_address_ =(void*) address;
++          new_record.op_.memory_access_.lock_count_ = raw_record_[index].op_.memory_access_.lock_count_;
++          for(int i = 0; i< new_record.op_.memory_access_.lock_count_; i++)
++            new_record.op_.memory_access_.lockset_[i] = raw_record_[index].op_.memory_access_.lockset_[i];
++          // write a new record into a new file which has the same format as the
++          // raw record file.
++          int nbytes = sizeof(struct Record);
++          if(write(new_record_fd_, &new_record, nbytes) == -1) {
++            perror("stop buffer");
++            printf("*********new_record_fd_:%d, write error:%d***********\n", new_record_fd_, errno);
++          }
++        }
++      } else {
++        // for non-memory operation, simple invalidate the result register
++        MAO_ASSERT(insn->IsRegisterOperand(1));
++        result_regentry = insn->GetRegisterOperand(1);
++        // set the reg map entry to -1 to denote this register is polluted.
++        InvalidateRegister(&forward_reg_map_, result_regentry);
++      }
++    } else { // backward compution
++      if (insn->IsMemOperand(0) || insn->IsMemOperand(1)) {
++        // load, invalidate the result register first, then compute memory.
++        // such as ld offset(%rax), rax
++        // 
++        if(insn->IsMemOperand(0)) { 
++          // What ever, we set the result register map as -1
++          result_regentry = insn->GetRegisterOperand(1);
++          // set the reg map entry to -1 to denote this register is polluted.
++          InvalidateRegister(&backward_reg_map_, result_regentry);
++          address = ComputeMemory(insn, index, 0, direction);
++          if(address == -1)
++            return ret;
++          struct Record new_record;
++          memset(&new_record, 0, sizeof(struct Record));
++          new_record.type_ = MEMORY_OP;
++          // set the memory type according to the insn
++          new_record.op_.memory_access_.is_write_ = 0;
++          // set the ip according to the seed insn and offset
++          long ip  =  raw_record_[index].op_.memory_access_.memory_op_.ip - offset;
++          // TODO(tianweis):How to handle the record_no??
++          new_record.record_no_ = raw_record_[index].record_no_;
++          new_record.thread_id_ = raw_record_[index].thread_id_;
++          new_record.op_.memory_access_.pip_ = (void*)ip;
++          new_record.op_.memory_access_.sip_ = (void*)ip;
++          new_record.op_.memory_access_.memory_address_ = (void*)address;
++          new_record.op_.memory_access_.lock_count_ = raw_record_[index].op_.memory_access_.lock_count_;
++          for(int i = 0; i< new_record.op_.memory_access_.lock_count_; i++)
++            new_record.op_.memory_access_.lockset_[i] = raw_record_[index].op_.memory_access_.lockset_[i];
++          // write a new record into a new file which has the same format as the
++          // raw record file.
++          int nbytes = sizeof(struct Record);
++          if(write(new_record_fd_, &new_record, nbytes) == -1) {
++            perror("stop buffer");
++            printf("*********new_record_fd_:%d, write error:%d***********\n", new_record_fd_, errno);
++          }
++        } else {
++          // Store operation, such as
++          // st %rax, offset(%rax), we do need to invaliate any thing
++          address = ComputeMemory(insn, index, 1, direction);
++          if(address == -1)
++            return ret;
++          struct Record new_record;
++          memset(&new_record, 0, sizeof(struct Record));
++          new_record.type_ = MEMORY_OP;
++          // set the memory type according to the insn
++          new_record.op_.memory_access_.is_write_ = 1;
++          // set the ip according to the seed insn and offset
++          long ip  =  raw_record_[index].op_.memory_access_.memory_op_.ip - offset;
++          // TODO(tianweis):How to handle the record_no??
++          new_record.record_no_ = raw_record_[index].record_no_;
++          new_record.thread_id_ = raw_record_[index].thread_id_;
++          new_record.op_.memory_access_.pip_ = (void*)ip;
++          new_record.op_.memory_access_.sip_ = (void*)ip;
++          new_record.op_.memory_access_.memory_address_ =(void*) address;
++          new_record.op_.memory_access_.lock_count_ = raw_record_[index].op_.memory_access_.lock_count_;
++          for(int i = 0; i< new_record.op_.memory_access_.lock_count_; i++)
++            new_record.op_.memory_access_.lockset_[i] = raw_record_[index].op_.memory_access_.lockset_[i];
++          // write a new record into a new file which has the same format as the
++          // raw record file.
++          int nbytes = sizeof(struct Record);
++          if(write(new_record_fd_, &new_record, nbytes) == -1) {
++            perror("stop buffer");
++            printf("*********new_record_fd_:%d, write error:%d***********\n", new_record_fd_, errno);
++          }
++        }
++      } else {
++        // for non-memory operation, simple invalidate the result register
++        MAO_ASSERT(insn->IsRegisterOperand(1));
++        result_regentry = insn->GetRegisterOperand(1);
++        // set the reg map entry to -1 to denote this register is polluted.
++        InvalidateRegister(&backward_reg_map_, result_regentry);
++      }
++    } // end of backward computation 
++      
++    return ret;
++  } // end of if (insn->IsOpMov() || insn->IsAdd() || insn->IsSub())
++
++  // For other cmp, test, jmp, we simple return
++  return ret;
++}
++
++void InstructSimPass::UpdateState(InstructionEntry* insn,
++                                  unsigned int op_index, long value,
++                                  bool is_memory) {
++  long offset = 0;
++  int scale;
++  long base_value;
++  int base_num;
++  int index_num;
++  ExpressionEntry * expr_entry = NULL;
++
++  offset = GetSimpleDisp(insn, op_index);
++  base_num = GetBaseRegisterNum(insn);
++  index_num = GetIndexRegisterNum(insn);
++  scale = GetScaleValue(insn);
++  expr_entry = new ExpressionEntry(base_num, index_num,
++                                   offset, scale, is_memory, true);
++  // TODO(tianweis): Check the correctness of the following code.
++  pair<ExpressionEntryMap::iterator, bool> map_status =
++      expr_map_.insert(ExpressionEntryMap::value_type(expr_entry, NULL));
++  if (map_status.second)
++    map_status.first->second = value;
++  else {
++    map_status.first->second = value;
++    delete expr_entry;
++  }
++
++  // If we have simpe format as offset(base), and is_memory is false we can
++  // compute the base register value, update the reigster file.
++  if (index_num == ~0 && offset != ~0 && !is_memory) {
++    base_value = value - offset;
++    register_file_[base_num] = base_value;
++  }
++}
++
++void InstructSimPass::ExecuteSimWhole(InstructionEntry* insn, long index, MaoEntryIntMap* offsets) {
++  // Each time we clear the register file state.
++  forward_reg_map_.clear();
++  InstructionEntry *next = NULL;
++  InstructionEntry *prev = NULL;
++  BasicBlock * bb = NULL;
++  BasicBlock * prev_bb = NULL;
++  BasicBlock * next_bb = NULL;
++  const reg_entry* result_regentry = NULL;
++  // Get the basic block insn belongs to
++  bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(insn);
++  MAO_ASSERT (bb != NULL);
++  if (insn != bb->last_entry()) {
++    next = insn->NextInstruction();
++    next_bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(next);
++  }
++  // first entry is not instruction, it always is the label
++  // how about we the insn is really the first insn type
++  // Now we only workaround to see if it's a jmp type.
++  if (insn != bb->first_entry()) {
++    prev = insn->PrevInstruction();
++    prev_bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(prev);
++  }
++  // Only we can handle op_mov,op_add, op_sub, op_cmp, op_test, op_jmp
++  if (!(InsnCanHandle(insn)))
++    return;
++
++
++  int insn_offset = (*offsets)[insn];
++  int offset = 0;
++  bool can_execute = true;
++  // For backward compution, we do not need to do anything for the backward map
++  // for concurrent instruction because it registers the value when the prev
++  // instruction retired.
++  while (prev != NULL && bb == prev_bb) {
++    offset = insn_offset -(*offsets)[prev];
++    can_execute = ComputeNewSampleWhole(prev, index, offset, 0);
++    if (!can_execute || prev == bb->first_entry())
++      break;
++    else {
++      prev = prev->PrevInstruction();
++      if(prev != NULL)
++        prev_bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(prev);
++    }
++  }
++  backward_reg_map_.clear();
++  // Note that we do need to  invalidate the result register for the current
++  // insn since we sampled the instruction retired events, i.e, the registers
++  // value represents the state BEFORE the current instruction retired. 
++  // set the reg map entry to -1 to denote this register is polluted.
++  if(insn->IsOpMov() || insn->IsAdd() || insn->IsSub() || insn->IsLea()) {
++    result_regentry = insn->GetRegisterOperand(1);
++    InvalidateRegister(&forward_reg_map_, result_regentry);
++  }
++  // Forward computation
++  can_execute = true;
++  while (next != NULL && bb == next_bb) {
++    offset = (*offsets)[next] - insn_offset;
++    can_execute = ComputeNewSampleWhole(next, index, offset, 1);
++    if (!can_execute || next == bb->last_entry())
++      break;
++    else {
++      next = next->NextInstruction();
++      if(next != NULL)
++        next_bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(next);
++    }
++  }
++
++  forward_reg_map_.clear();
++
++}
++
++
++
++// The main instruction simulation phase, now we only support memory operations
++// which use the MOV opcond
++void InstructSimPass::ExecuteSim(InstructionEntry* insn, long value) {
++  // Each time we clear the register file state.
++  memset(register_file_, ~0, i386_regtab_size*sizeof(long));
++  expr_map_.clear();
++  InstructionEntry *next = NULL;
++  InstructionEntry *prev = NULL;
++  BasicBlock * bb = NULL;
++  // Get the basic block insn belongs to
++  bb = CFG::GetCFG(unit_, function_)->FindBasicBlock(insn);
++  MAO_ASSERT (bb != NULL);
++  if (insn != bb->last_entry())
++    next = insn->NextInstruction();
++  if (insn != bb->first_entry())
++    prev = insn->PrevInstruction();
++  // Only we can handle op_mov,op_add, op_sub.
++  if (!(insn->IsOpMov() || insn->IsAdd() ||
++        insn->IsSub() || insn->NumOperands() != 2))
++    return;
++  if (!insn->IsMemOperand(1) && !insn->IsMemOperand(0))
++    return;
++
++  // For load instruction
++  if (insn->IsMemOperand(0)) {
++    // The last param is false which means that
++    // offset+base+index*sacle = value while true means
++    // LD/ST(offset+base+index*scale)= value
++    UpdateState(insn, 0, value, false);
++  }
++
++  // For store instruction
++  if (insn->IsMemOperand(1)) {
++    UpdateState(insn,1, value, false);
++  }
++
++  // Backward computation
++  bool can_execute = true;
++  while (prev != NULL) {
++    can_execute = ComputeNewSample(prev, false);
++    if (!can_execute || prev == bb->first_entry())
++      break;
++    else
++      prev = prev->PrevInstruction();
++  }
++
++  // TODO(tianweis): Handle the execution of insn itself,
++  // then forward computation for next insn.
++  // Forward computation
++  can_execute = true;
++  while (next != NULL) {
++    can_execute = ComputeNewSample(next, true);
++    if (!can_execute || next == bb->last_entry())
++      break;
++    else
++      next = next->NextInstruction();
++  }
++}
++
++long InstructSimPass::GetValueFromRegister(const reg_entry* reg, long
++                                           record_index, int direction) {
++  // predefined registers
++  const reg_entry *r_eip = GetRegFromName("eip"); 
++  const reg_entry *r_eax = GetRegFromName("eax");
++  const reg_entry *r_ebx = GetRegFromName("ebx");
++  const reg_entry *r_ecx = GetRegFromName("ecx");
++  const reg_entry *r_edx = GetRegFromName("edx");
++  const reg_entry *r_esi = GetRegFromName("esi");
++  const reg_entry *r_edi = GetRegFromName("edi");
++  const reg_entry *r_ebp = GetRegFromName("ebp");
++  const reg_entry *r_esp = GetRegFromName("esp");
++
++  const reg_entry *r_rip = GetRegFromName("rip"); 
++  const reg_entry *r_rax = GetRegFromName("rax");
++  const reg_entry *r_rbx = GetRegFromName("rbx");
++  const reg_entry *r_rcx = GetRegFromName("rcx");
++  const reg_entry *r_rdx = GetRegFromName("rdx");
++  const reg_entry *r_rsi = GetRegFromName("rsi");
++  const reg_entry *r_rdi = GetRegFromName("rdi");
++  const reg_entry *r_rbp = GetRegFromName("rbp");
++  const reg_entry *r_rsp = GetRegFromName("rsp");
++
++  const reg_entry *r_r8  = GetRegFromName("r8");
++  const reg_entry *r_r9  = GetRegFromName("r9");
++  const reg_entry *r_r10 = GetRegFromName("r10");
++  const reg_entry *r_r11 = GetRegFromName("r11");
++  const reg_entry *r_r12 = GetRegFromName("r12");
++  const reg_entry *r_r13 = GetRegFromName("r13");
++  const reg_entry *r_r14 = GetRegFromName("r14");
++  const reg_entry *r_r15 = GetRegFromName("r15");
++  
++  // If the reg is already polluted, we simply return -1
++  // TODO(tianweis): use map.find??
++  // direction == 2 is not only for update memory, not for
++  // sampling extending phase.
++  if(direction == 0) {
++    if(backward_reg_map_[reg] == -1)
++      return -1;
++  } else if (direction == 1) {
++    if(forward_reg_map_[reg] == -1)
++      return -1;
++  }
++ 
++  // the final memory address is: offset+base+index*scale
++  if(reg == r_eip || reg == r_rip) 
++    return raw_record_[record_index].op_.memory_access_.memory_op_.ip;
++  // Since rax and eax are two different reg, we still need to 
++  // check if one of them are invalidate.
++  // for example, if reg = r_rax, it's not invalidate,
++  // but the r_eax is invalid, so we should get that r_rax is
++  // also invalid.
++  if(reg == r_eax || reg == r_rax) {
++    return raw_record_[record_index].op_.memory_access_.memory_op_.eax;
++  }
++  if(reg == r_ebx || reg == r_rbx)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.ebx;
++  if(reg == r_ecx || reg == r_rcx)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.ecx;
++  if(reg == r_edx || reg == r_rdx)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.edx;
++  if(reg == r_esi || reg == r_rsi)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.esi;
++  if(reg == r_edi || reg == r_rdi)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.edi;
++  if(reg == r_ebp || reg == r_rbp)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.ebp;
++  if(reg == r_esp || reg == r_rsp)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.esp;
++  if(reg == r_r8)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r8;
++  if(reg == r_r9)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r9;
++  if(reg == r_r10)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r10;
++  if(reg == r_r11)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r11;
++  if(reg == r_r12)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r12;
++  if(reg == r_r13)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r13;
++  if(reg == r_r14)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r14;
++  if(reg == r_r15)
++    return raw_record_[record_index].op_.memory_access_.memory_op_.r15;
++  // TODO(tianweis): for other unknown registers, such xmm, mmx, etc, we need to 
++  // design a better to handle the return value
++  return 0;
++  //MAO_ASSERT(0);
++}
++long InstructSimPass::ComputeMemory(InstructionEntry* insn,
++                                    long record_index, int op_index, int direction) {
++  long offset = 0;
++  int scale;
++  long base_value = 0;
++  long index_value = 0;
++  int base_num;
++  int index_num;
++
++  offset = GetSimpleDisp(insn, op_index);
++  base_num = GetBaseRegisterNum(insn);
++  index_num = GetIndexRegisterNum(insn);
++  scale = GetScaleValue(insn);
++  const reg_entry *base_reg = insn->GetBaseRegister();
++  const reg_entry *index_reg = insn->GetIndexRegister();
++
++  // If base_reg is rbp or rsp, we do need to compute memory them
++  // because they are local variables.
++  const reg_entry *r_rbp = GetRegFromName("rbp");
++  const reg_entry *r_rsp = GetRegFromName("rsp");
++  if(base_reg == r_rbp || base_reg == r_rsp)
++    return -1;
++  if(index_reg != NULL)
++    index_value = GetValueFromRegister(index_reg, record_index, direction);
++  base_value = GetValueFromRegister(base_reg, record_index, direction);
++  if(index_value != -1 && base_value != -1 && offset != -1 ) {
++    long memory_address = offset + base_value + index_value*scale;
++    //printf("we compute the memory address is:0x%lx\n",memory_address);
++    return memory_address;
++  }
++  return -1;
++}
++
++// TODO(tianweis): Handle more types of load and store instructions.
++// Now only simple mov instruction is supported.
++void InstructSimPass::UpdateMemory(InstructionEntry* insn, long index) {
++  // For OP_MOV instruction
++  if(insn->IsOpMov()) {
++    if (insn->IsMemOperand(0)) {
++      // The last param is false which means that
++      // offset+base+index*sacle = value while true means
++      // LD/ST(offset+base+index*scale)= value
++      long address = ComputeMemory(insn, index, 0, 2);
++      if(address != -1) 
++        raw_record_[index].op_.memory_access_.memory_address_ = (void*)address;
++      raw_record_[index].op_.memory_access_.is_write_ = 0;	
++      
++    }
++    
++    // For store instruction
++    if (insn->IsMemOperand(1)) {
++      long address = ComputeMemory(insn, index, 1, 2);
++      if(address != -1) 
++        raw_record_[index].op_.memory_access_.memory_address_ = (void*)address;
++      raw_record_[index].op_.memory_access_.is_write_ = 1;
++    }
++  }
++}
++
++void InstructSimPass::PrintList(RacezInstructionSampleList *samples) {
++  for (RacezInstructionSampleList::iterator sample = samples->begin();
++       sample != samples->end(); ++sample) { 
++    TraceC(1, "%d+%d (in %s)\n", (*sample)->index,
++         (*sample)->offset, (*sample)->file.c_str());
++  }
++}
++
++bool InstructSimPass::Go() {
++  RacezProfileReader reader(pmuprofile_file_);
++
++  BuildFileTable();
++  // TODO(tianweis): Here we hardcode to use index 1 as the
++  // the current source file. We will assertion while meeting 
++  // violation.
++  // There are some problem with this code, especially for C++ code, where .h
++  // also includes some implementation code, we need to strictly follow the 
++  // update source file step.
++  // However, it is not easy for us to do this because now we read the sample
++  // together before traversing the MAO IR, i.e, we do not know how to filter
++  // the samples in the Read file because we do not have IR yet.
++  // TODO(tianweis): This problem arises when compile
++  // PARSEC/facesim/Public_Library/Forces_And_Torques 
++  // /DIAGONALIZED_FINITE_VOLUME_3D.cpp
++  const string *current_source_file = &file_table_[1];
++  // Clear the list before reading the sample for a function.
++  ClearSampleList();
++
++  if(raw_record_ == NULL) {
++    raw_record_ =  (struct Record*)mmap(0, raw_file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, raw_fd_, 0);
++    if (raw_record_ == MAP_FAILED) {
++      close(raw_fd_);
++      perror("Error mmapping the file");
++      MAO_ASSERT(0);
++    }
++  }  
++  
++  new_record_fd_ = open("/tmp/new.txt",O_RDWR|O_APPEND|O_CREAT, 0777);
++  if(new_record_fd_ < 0) {
++    perror("error is:");
++    printf("errno in init_buffer is %d\n", errno);
++    printf("open file error!!!\n");
++    MAO_ASSERT(0);
++  }
++  printf("Now we are processing the function %s\n", function_->name().c_str());
++  // Given the function name and samples map,
++  // return the map from offset into values for this function.
++  // TODO(tianweis): Here we filter the samples which has different
++  // filenames. 
++  if (!reader.Read(function_->name(), &samples_, current_source_file)) {
++    munmap(raw_record_, raw_file_size_);
++    raw_record_ = NULL;
++    close(new_record_fd_);
++    return true;
++  }
++  //PrintList(&samples_);
++
++  // Sort the samples list.
++  samples_.sort(RacezInstructionSampleLessThan);
++  
++  // We only work on non-empty samples list
++  if(samples_.size() == 0) {
++    munmap(raw_record_, raw_file_size_);
++    raw_record_ = NULL;
++    close(new_record_fd_);
++    return true;
++  }
++  //fprintf(stderr,"number of list entries are %d\n", samples_.size());
++  // Get the size map for this function
++  Section *section = function_->GetSection();
++  MaoEntryIntMap *sizes = MaoRelaxer::GetSizeMap(unit_, section);
++  MaoEntryIntMap *offsets = MaoRelaxer::GetOffsetMap(unit_, section);
++  // For each sample, attribute it to the corresponding instruction
++  long offset = 0;
++  SectionEntryIterator entry_iter = function_->EntryBegin();
++  current_source_file = UpdateSourceFile(*entry_iter, current_source_file);
++  //printf("current source file is %s\n", (*current_source_file).c_str());
++
++  PrintList(&samples_);
++  // Note that we already sorted the list, and duplicated elements are put together
++  for (RacezInstructionSampleList::iterator sample = samples_.begin();
++       sample != samples_.end(); ++sample) {
++    while (offset < (*sample)->offset && entry_iter != function_->EntryEnd()) {
++      int size = (*sizes)[*entry_iter];
++      if(size != 0) 
++        offset += size;
++      ++entry_iter;
++      current_source_file = UpdateSourceFile(*entry_iter,
++                                             current_source_file);
++      // TODO(tianweis): Now we simple return if the current_source_file is not
++      // equal to the index 1
++      if(*current_source_file != (*sample)->file) {
++        munmap(raw_record_, raw_file_size_);
++        raw_record_ = NULL;
++        close(new_record_fd_);
++        return true;
++      }
++    }
++    int same_offset = 0;
++    // We first advance to the Instruction type entry
++    while ((*entry_iter)->Type() != MaoEntry::INSTRUCTION) {
++      MAO_ASSERT((*current_source_file) == (*sample)->file);
++      ++entry_iter;
++    }
++    // Process the set of samples which have the same offset together.
++    while (offset == (*sample)->offset && sample != samples_.end()) {
++      // Only annotate profiles on to instructions with matching filenames.
++      MAO_ASSERT((*entry_iter)->Type() == MaoEntry::INSTRUCTION);
++      InstructionEntry *insn = (*entry_iter)->AsInstruction();
++      // Here, we first compute the memory address for the current instruction
++      UpdateMemory(insn,(*sample)->index);
++      // Here, we do static instruction simulation until the boundary 
++      // of the current basic block.
++      // Currently only whole register state value is support.
++      // Additional, we only extend the samples which comes from PMU, not for
++      // sip, why we have this limit??
++    
++      //if(raw_record_[(*sample)->index].op_.memory_access_.pip_ != 
++      //   raw_record_[(*sample)->index].op_.memory_access_.sip_ )
++      ExecuteSimWhole(insn, (*sample)->index, offsets);
++//       TraceC(1, "%s+0x%lx (in %s)\t%ld\t-- ", function_->name().c_str(),
++//              (*sample)->offset, (*sample)->file.c_str(), (*sample)->value);
++//       if (tracing_level() >= 1) {
++//         (*entry_iter)->PrintIR(stderr);
++//         fprintf(stderr, "\n");
++//       }
++      same_offset++;
++      sample++;
++    }
++    //printf("sample offset for %d is: %d\n",offset, same_offset);
++    // Let the sample points to the last element of same offset set
++    if (same_offset >= 1)
++      sample--;
++    int size = (*sizes)[*entry_iter];
++    offset += size;
++    ++entry_iter;
++    current_source_file = UpdateSourceFile(*entry_iter,
++                                           current_source_file);
++    if(*current_source_file != (*sample)->file) {
++      munmap(raw_record_, raw_file_size_);
++      raw_record_ = NULL;
++      close(new_record_fd_);
++      return true;
++    }
++  }
++  munmap(raw_record_, raw_file_size_);
++  raw_record_ = NULL;
++  close(new_record_fd_);
++  return true;
++}
++REGISTER_FUNC_PASS("INSTSIM", InstructSimPass)
+Index: MaoCFG.h
+===================================================================
+--- MaoCFG.h	(revision 648)
++++ MaoCFG.h	(working copy)
+@@ -187,6 +187,7 @@
+  public:
+   typedef std::vector<BasicBlock *> BBVector;
+   typedef std::map<const char *, BasicBlock *, ltstr> LabelToBBMap;
++  typedef std::map<InstructionEntry *, BasicBlock *> InsnToBBMap;
+ 
+   explicit CFG(MaoUnit *mao_unit) : mao_unit_(mao_unit),
+                                           num_external_jumps_(0),
+@@ -222,7 +223,10 @@
+   void MapBasicBlock(BasicBlock *bb) {
+     MAO_ASSERT(basic_block_map_.insert(std::make_pair(bb->label(), bb)).second);
+   }
+-
++  void MapInsnBasicBlock(InstructionEntry *insn_entry, BasicBlock *bb) {
++    MAO_ASSERT(insn_basic_block_map_.insert(
++        std::make_pair(insn_entry, bb)).second);
++  }
+   // Getter methods
+   BasicBlock *GetBasicBlock(BasicBlockID id) { return basic_blocks_[id]; }
+   BasicBlock *FindBasicBlock(const char *label) {
+@@ -231,6 +235,12 @@
+       return NULL;
+     return bb->second;
+   }
++  BasicBlock *FindBasicBlock(InstructionEntry *insn_entry) {
++    InsnToBBMap::iterator bb = insn_basic_block_map_.find(insn_entry);
++    if (bb == insn_basic_block_map_.end())
++      return NULL;
++    return bb->second;
++  }
+   BBVector::iterator Begin() { return basic_blocks_.begin(); }
+   BBVector::const_iterator Begin() const { return basic_blocks_.begin(); }
+ 
+@@ -284,6 +294,7 @@
+  private:
+   MaoUnit *mao_unit_;
+   LabelToBBMap basic_block_map_;
++  InsnToBBMap  insn_basic_block_map_;
+   BBVector basic_blocks_;
+ 
+   int num_external_jumps_;  // Number of branches that have labels not defined
+Index: MaoUnit.cc
+===================================================================
+--- MaoUnit.cc	(revision 648)
++++ MaoUnit.cc	(working copy)
+@@ -3210,7 +3210,14 @@
+   return op() == OP_add;
+ }
+ 
++bool InstructionEntry::IsSub() const {
++  return op() == OP_sub;
++}
+ 
++bool InstructionEntry::IsLea() const {
++  return op() == OP_lea;
++}
++
+ //
+ // Class: SubSection
+ //
+@@ -3400,3 +3407,34 @@
+     return prev_->AsInstruction();
+   return NULL;
+ }
++
++// TODO(tianweis): Rename the function to distinguish
++// it with nextInstruction.
++// Get the next instruction, return NULL only if there is
++// no further instruction and do not care about the basic
++// block boundry.
++InstructionEntry *MaoEntry::NextInstruction() {
++  InstructionEntry *insn = NULL;
++  MaoEntry *next = next_;
++  while (next) {
++    if (next->IsInstruction()) {
++      insn = next->AsInstruction();
++      break;
++    }
++    next = next->next();
++  }
++  return insn;
++}
++
++InstructionEntry *MaoEntry::PrevInstruction() {
++  InstructionEntry *insn = NULL;
++  MaoEntry *prev = prev_;
++  while (prev) {
++    if (prev->IsInstruction()) {
++      insn = prev->AsInstruction();
++      break;
++    }
++    prev = prev->prev();
++  }
++  return insn;
++}
+Index: MaoCFG.cc
+===================================================================
+--- MaoCFG.cc	(revision 648)
++++ MaoCFG.cc	(working copy)
+@@ -262,6 +262,11 @@
+     if (entry->Type() == MaoEntry::LABEL)
+       label_to_bb_map_[static_cast<LabelEntry *>(entry)->name()] = current;
+ 
++    // If the current entry is a insn, update the map of insn
++    if (entry->Type() == MaoEntry::INSTRUCTION)
++      CFG_->MapInsnBasicBlock(entry->AsInstruction(),
++                              current);
++
+     // Check to see if this operation creates out edges
+     int inserted_edges = 0;
+     if (entry->IsInstruction() &&
+Index: MaoDefs.cc
+===================================================================
+--- MaoDefs.cc	(revision 648)
++++ MaoDefs.cc	(working copy)
+@@ -45,7 +45,7 @@
+   BitString        &sub_regs() { return sub_regs_; }
+   BitString        &parent_regs() { return parent_regs_; }
+   const char       *name() { return reg_->reg_name; }
+-
++  int               num() { return num_;}
+   void        AddSubReg(BitString &bstr) {
+     sub_regs_ = sub_regs_ | bstr;
+   }
+@@ -592,7 +592,37 @@
+   return (*it).second->reg();
+ }
+ 
++int GetBaseRegisterNum(InstructionEntry *insn) {
++  const reg_entry * reg;
++  int base_reg_num;
++  reg = insn->GetBaseRegister();
++  if (reg) {
++    base_reg_num = reg_ptr_map.find(reg)->second->num();
++  } else {
++    base_reg_num = ~0;
++  }
++  return base_reg_num;
++}
+ 
++int GetIndexRegisterNum(InstructionEntry *insn) {
++  const reg_entry *reg;
++  int index_reg_num;
++  reg = insn->GetIndexRegister();
++  if (reg) {
++    index_reg_num = reg_ptr_map.find(reg)->second->num();
++  } else {
++    index_reg_num = ~0;
++  }
++  return index_reg_num;
++}
++
++int GetRegisterOperandNum(InstructionEntry *insn, const unsigned int op_index) {
++  const reg_entry *reg;
++  reg = insn->GetRegisterOperand(op_index);
++  MAO_ASSERT(reg != NULL);
++  return reg_ptr_map.find(reg)->second->num();
++}
++
+ bool IsRegDefined(InstructionEntry *insn, const reg_entry *reg) {
+   // TODO(martint): Improve this slow implementation.
+   std::set<const reg_entry *> defined_regs = GetDefinedRegisters(insn);
