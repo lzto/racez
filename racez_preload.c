@@ -136,7 +136,7 @@ int pthread_mutex_unlock(pthread_mutex_t *m) {
   }
   return r;
 }
-/*
+
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
   pthread_once(&initializer, preload_init);
 
@@ -174,7 +174,6 @@ int pthread_cond_signal(pthread_cond_t *cond) {
   }
   return result;
 }
-*/
 
 void* malloc(size_t size) {
   pthread_once(&initializer, preload_init);
