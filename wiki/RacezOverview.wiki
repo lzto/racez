@@ -10,10 +10,38 @@ as the two memory operations(read,write). RACEZ also instruments
 the lock/unlock operations. However, it uses a different approach
 to obtain the trace of memory addresses. Instead of instrumenting
 each memory access, addresses are obtained from PMU samples.
-http://code.google.com/images/racez.pnd
-= Details =
 
-Add your content here.  Format your content with:
-  * Text in *bold* or _italic_
-  * Headings, paragraphs, and lists
-  * Automatic links to other wiki pages
+= Examples =
+
+A program with a Race
+{{{
+1 T1:
+2 Lock(L)
+3 ..........
+4 Write X
+5 ..........
+6 Unlock(L)
+7 .........
+8 T2:
+9 ..........
+10 Read X
+11 ........
+}}}
+
+Traditional method:
+{{{
+T1:
+//Instrument lock operation
+Lock(L)
+..........
+//Instrument Memory operation
+Write X
+..........
+Unlock(L)
+//Instrument unlock operation
+T2:
+..........
+//Instrument Memory operation
+Read X
+.....
+}}}
