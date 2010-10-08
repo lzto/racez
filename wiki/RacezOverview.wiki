@@ -76,3 +76,10 @@ PMU. The hardware PMU is accessed through a kernel system call
 interface. For each sample, the PMU generates processor interrupts
 which the kernel eventually transforms into an asynchronous signal
 delivered to the user application.
+
+For the code in above figure, when the Write operation is sampled
+by the PMU, the signal handler in T1 records the current register
+values together with the currently held lockset {L} to the log file. If
+a Read operation of the same shared variable with a disjoint lockset
+is sampled by the PMU in another thread, RACEZ’s offline analysis
+tool will report a warning for these two memory references.
