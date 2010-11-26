@@ -1,4 +1,4 @@
-This page shows the overview of Racez's architecture. Since our paper is still in review process, more detailed information will be added when the result is out.
+This page shows the overview of Racez's architecture. The paper for Racez has been accepted by ICSE'11 and will appear next May at Waikiki, Honolulu, Hawaii.
 
 = Introduction =
 All data race detection tools require traces containing synchronization
