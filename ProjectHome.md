@@ -1,0 +1,1 @@
+This project is a lightweight data race detection tool based on performance monitor unit (PMU). Preliminary result shows that it has very low overhead and perturbation to the original program and detect races with a probability.
